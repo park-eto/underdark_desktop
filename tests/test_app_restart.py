@@ -69,6 +69,38 @@ class TestAppRestart(unittest.TestCase):
         self.assertIsNotNone(overlay)
         self.assertEqual(overlay.shape, frame.shape)
 
+    def test_adb_crash_detection_and_launch_for_bluestacks(self):
+        """BlueStacks Air 등 런처 종류와 무관하게 ADB 기반 앱 튕김 감지 및 직접 재실행 검증"""
+        from unittest.mock import MagicMock
+        from src.core.adb_client import AdbClient
+
+        adb = AdbClient()
+        adb.is_connected = True
+        adb.device = MagicMock()
+        adb.device.shell.side_effect = lambda cmd: (
+            "package:com.FreeDust.UnderDark\n" if "pm list packages" in cmd
+            else "Events injected: 1" if "monkey" in cmd
+            else ""
+        )
+
+        # 1) 패키지 자동 탐색
+        self.assertEqual(adb.find_game_package(), "com.FreeDust.UnderDark")
+
+        # 2) BlueStacks 홈 런처가 포그라운드인 경우 -> 튕김 감지 True
+        adb.device.app_current.return_value = MagicMock(package="com.bluestacks.appmart")
+        worker = MacroWorker(adb, self.detector, MagicMock())
+        crashed, reason = worker._check_adb_app_crashed()
+        self.assertTrue(crashed)
+        self.assertIn("com.bluestacks.appmart", reason)
+
+        # 3) UnderDark가 포그라운드인 경우 -> 튕김 감지 False
+        adb.device.app_current.return_value = MagicMock(package="com.FreeDust.UnderDark")
+        crashed_game, _ = worker._check_adb_app_crashed()
+        self.assertFalse(crashed_game)
+
+        # 4) ADB 직접 재실행 호출 검증
+        self.assertTrue(adb.launch_app())
+
 if __name__ == '__main__':
     unittest.main()
 

@@ -323,6 +323,35 @@ class MacroWorker(QThread):
         self.log_signal.emit("[펫합성] 🐾 펫 자동 일괄 합성 루틴 완료! 정상 파밍으로 복귀합니다.")
         self.status_signal.emit("펫 합성 완료 -> 파밍 재개")
 
+    def _check_adb_app_crashed(self) -> tuple[bool, str]:
+        """
+        아이콘 이미지 매칭에 의존하지 않고 ADB로 UnderDark 앱이 종료(튕김)되었거나
+        홈 런처(LDPlayer / BlueStacks Air 등)로 빠져나갔는지 직접 판별.
+        """
+        if not hasattr(self.adb, "get_foreground_package"):
+            return False, ""
+
+        game_pkg = self.adb.find_game_package()
+        fg_pkg = self.adb.get_foreground_package()
+        if not fg_pkg:
+            return False, ""
+
+        if fg_pkg.lower() == game_pkg.lower():
+            return False, ""
+
+        fg_lower = fg_pkg.lower()
+        launcher_keywords = (
+            "launcher", "bluestacks", "appmart", "home", "trebuchet", "ldlauncher"
+        )
+        if any(kw in fg_lower for kw in launcher_keywords):
+            return True, f"홈/런처 화면 감지 ({fg_pkg})"
+
+        running = self.adb.is_app_running(game_pkg)
+        if running is False:
+            return True, f"게임 프로세스 종료 확인 (현재 포그라운드: {fg_pkg})"
+
+        return False, ""
+
     def run(self):
         self.running = True
         if self.mode == self.MODE_STAGE_FARMING:
@@ -449,6 +478,17 @@ class MacroWorker(QThread):
                     self.last_state = state
                     self.state_repeat_count = 0
 
+                # UNKNOWN 상태가 2회 이상 지속되면 ADB로 앱 튕김/홈 이탈 여부를 직접 교차 검증
+                # (BlueStacks Air 등 런처 아이콘 크기/모양이 달라도 100% 튕김 감지)
+                adb_crash_reason = ""
+                if state == "UNKNOWN" and self.state_repeat_count >= 2 and (self.state_repeat_count % 3 == 2):
+                    is_adb_crashed, adb_crash_reason = self._check_adb_app_crashed()
+                    if is_adb_crashed:
+                        state = "APP_CRASHED"
+                        target_coords = None
+                        self.current_state = state
+                        self.stats["current_state"] = state
+
                 # 프리뷰 오버레이 송출
                 debug_frame = self.detector.draw_debug_overlay(
                     frame, False, score, state=state, target_coords=target_coords
@@ -456,7 +496,7 @@ class MacroWorker(QThread):
                 self.frame_signal.emit(debug_frame)
 
                 # ==========================================================
-                # [공통 처리] 게임 비정상 종료 (앱 튕김) -> 바탕화면 UnderDark 아이콘 클릭 재실행
+                # [공통 처리] 게임 비정상 종료 (앱 튕김) -> ADB 직접 실행 우선, 실패 시 아이콘 터치 폴백
                 # ==========================================================
                 if state == "APP_CRASHED":
                     if not self.auto_restart_app:
@@ -465,10 +505,18 @@ class MacroWorker(QThread):
                         time.sleep(1.0)
                         continue
 
-                    cx, cy = target_coords if target_coords else (int(0.60 * fw), int(0.22 * fh))
                     self.status_signal.emit("게임 튕김 감지! 재실행 중...")
-                    self.log_signal.emit(f"[앱 재실행] 게임 비정상 종료(튕김) 감지 -> UnderDark 아이콘 터치 ({cx}, {cy})")
-                    self.adb.tap(cx, cy)
+                    launched_via_adb = False
+                    if hasattr(self.adb, "launch_app"):
+                        launched_via_adb = self.adb.launch_app()
+
+                    if launched_via_adb:
+                        reason_tag = f" ({adb_crash_reason})" if adb_crash_reason else ""
+                        self.log_signal.emit(f"[앱 재실행] 게임 비정상 종료 감지{reason_tag} -> ADB로 UnderDark 앱 직접 재실행 완료")
+                    else:
+                        cx, cy = target_coords if target_coords else (int(0.60 * fw), int(0.22 * fh))
+                        self.log_signal.emit(f"[앱 재실행] 게임 비정상 종료(튕김) 감지 -> UnderDark 아이콘 터치 ({cx}, {cy})")
+                        self.adb.tap(cx, cy)
 
                     self.game_start_time = None
                     self.initial_cmd_executed = False

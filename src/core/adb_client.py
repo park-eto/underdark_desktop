@@ -99,13 +99,16 @@ _configure_adb_environment()
 
 class AdbClient:
     """
-    LDPlayer 및 안드로이드 에뮬레이터 연결 및 제어를 담당하는 클래스.
+    LDPlayer, BlueStacks Air 및 안드로이드 에뮬레이터 연결 및 제어를 담당하는 클래스.
     """
+    DEFAULT_GAME_PACKAGE = "com.FreeDust.UnderDark"
+
     def __init__(self, serial: Optional[str] = None):
         _configure_adb_environment()
         self.serial = serial
         self.device: Optional[AdbDevice] = None
         self.is_connected = False
+        self._game_package: Optional[str] = None
 
     @staticmethod
     def _discover_bluestacks_ports() -> List[int]:
@@ -209,6 +212,7 @@ class AdbClient:
     def disconnect(self):
         self.device = None
         self.is_connected = False
+        self._game_package = None
 
     def capture_screen(self) -> Optional[np.ndarray]:
         """
@@ -304,3 +308,69 @@ class AdbClient:
                 h, w, _ = img.shape
                 return w, h
             return None
+
+    def find_game_package(self, keyword: str = "underdark") -> str:
+        """
+        디바이스에 설치된 UnderDark 패키지명을 자동 탐색(캐시).
+        탐색 실패 시 기본 패키지명(com.FreeDust.UnderDark) 반환.
+        """
+        if self._game_package:
+            return self._game_package
+
+        if self.is_connected and self.device:
+            try:
+                out = self.device.shell("pm list packages -3")
+                if out:
+                    kw = keyword.lower()
+                    for line in out.splitlines():
+                        line = line.strip()
+                        if line.startswith("package:"):
+                            pkg = line[len("package:"):].strip()
+                            if kw in pkg.lower():
+                                self._game_package = pkg
+                                return pkg
+            except Exception as e:
+                print(f"[ADB] 패키지 목록 조회 실패: {e}")
+
+        return self.DEFAULT_GAME_PACKAGE
+
+    def get_foreground_package(self) -> Optional[str]:
+        """현재 포그라운드(화면 최상단)에 실행 중인 안드로이드 패키지명 반환"""
+        if not self.is_connected or not self.device:
+            return None
+        try:
+            info = self.device.app_current()
+            if info and getattr(info, "package", None):
+                return str(info.package)
+        except Exception:
+            pass
+        return None
+
+    def is_app_running(self, package_name: Optional[str] = None) -> Optional[bool]:
+        """지정된 패키지 프로세스가 현재 살아 있는지 여부 반환 (ADB 오류 시 None)"""
+        if not self.is_connected or not self.device:
+            return None
+        pkg = package_name or self.find_game_package()
+        try:
+            out = self.device.shell(f"pidof {pkg}")
+            return bool(out and out.strip())
+        except Exception:
+            return None
+
+    def launch_app(self, package_name: Optional[str] = None) -> bool:
+        """
+        에뮬레이터 종류(LDPlayer / BlueStacks Air 등)와 아이콘 위치에 무관하게
+        ADB monkey 명령으로 UnderDark 앱을 직접 실행.
+        """
+        if not self.is_connected or not self.device:
+            return False
+        pkg = package_name or self.find_game_package()
+        try:
+            out = self.device.shell(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+            if out and "No activities found" in out:
+                print(f"[ADB] 앱 실행 실패(액티비티 없음): {pkg}")
+                return False
+            return True
+        except Exception as e:
+            print(f"[ADB] 앱 직접 실행 실패 ({pkg}): {e}")
+            return False
