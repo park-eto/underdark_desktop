@@ -1,6 +1,10 @@
 import sys
 import os
 
+# PyInstaller macOS .app 번들에서 OpenCV(cv2) 재귀 임포트 방지
+if getattr(sys, "frozen", False):
+    sys.OpenCV_REPLACE_SYS_PATH_0 = True
+
 # 모듈 경로 추가
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
