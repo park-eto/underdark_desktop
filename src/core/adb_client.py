@@ -1,5 +1,7 @@
 import os
+import re
 import sys
+import socket
 import shutil
 import time
 import cv2
@@ -60,6 +62,7 @@ def _configure_adb_environment() -> None:
             "/usr/local/bin/adb",
             os.path.expanduser("~/Library/Android/sdk/platform-tools/adb"),
             "/Applications/BlueStacks.app/Contents/MacOS/hd-adb",
+            "/Applications/BlueStacks Air.app/Contents/MacOS/hd-adb",
         ])
 
     for path in candidate_paths:
@@ -104,10 +107,68 @@ class AdbClient:
         self.device: Optional[AdbDevice] = None
         self.is_connected = False
 
+    @staticmethod
+    def _discover_bluestacks_ports() -> List[int]:
+        """BlueStacks / BlueStacks Air 설정 파일(bluestacks.conf)에서 활성 ADB 포트 자동 추출"""
+        conf_paths = [
+            "/Users/Shared/Library/Application Support/BlueStacks/bluestacks.conf",
+            os.path.expanduser("~/Library/Application Support/BlueStacks/bluestacks.conf"),
+            r"C:\ProgramData\BlueStacks_nxt\bluestacks.conf",
+            r"C:\ProgramData\BlueStacks\bluestacks.conf",
+        ]
+        ports: List[int] = []
+        pattern = re.compile(r'adb_port\s*=\s*"?(\d+)"?')
+        for conf_path in conf_paths:
+            if os.path.isfile(conf_path):
+                try:
+                    with open(conf_path, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if "adb_port" in line:
+                                m = pattern.search(line)
+                                if m:
+                                    p = int(m.group(1))
+                                    if 1024 <= p <= 65535 and p not in ports:
+                                        ports.append(p)
+                except Exception:
+                    pass
+        return ports
+
+    @staticmethod
+    def _is_local_port_open(port: int, timeout: float = 0.15) -> bool:
+        """127.0.0.1:<port>가 실제로 열려 있는지 초고속 TCP 체크"""
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            return s.connect_ex(("127.0.0.1", port)) == 0
+        except Exception:
+            return False
+        finally:
+            s.close()
+
+    def _auto_connect_local_emulators(self) -> None:
+        """
+        BlueStacks Air(macOS)처럼 adb devices에 자동 등록되지 않고 TCP connect가 필요한
+        로컬 에뮬레이터 포트를 자동 탐색하여 adb connect 수행
+        """
+        candidate_ports: List[int] = self._discover_bluestacks_ports()
+        for default_port in (5555, 5556, 5557, 5559, 5565, 5575, 5585, 5587):
+            if default_port not in candidate_ports:
+                candidate_ports.append(default_port)
+
+        for port in candidate_ports:
+            if self._is_local_port_open(port):
+                try:
+                    adb.connect(f"127.0.0.1:{port}", timeout=2.0)
+                except Exception:
+                    pass
+
     def list_devices(self) -> List[str]:
-        """연결 가능한 ADB 디바이스 시리얼 목록 반환"""
+        """연결 가능한 ADB 디바이스 시리얼 목록 반환 (BlueStacks Air 포트 자동 탐색 포함)"""
         try:
             devices = adb.device_list()
+            if not devices:
+                self._auto_connect_local_emulators()
+                devices = adb.device_list()
             return [d.serial for d in devices]
         except Exception as e:
             print(f"[ADB] 디바이스 목록 조회 실패: {e}")
@@ -116,24 +177,18 @@ class AdbClient:
     def connect(self, serial: Optional[str] = None) -> bool:
         """
         ADB 디바이스에 연결.
-        serial이 없으면 기본 LDPlayer 포트(127.0.0.1:5555 등)를 자동 스캔하거나 첫 번째 디바이스에 연결.
+        serial이 없으면 BlueStacks Air / LDPlayer 포트를 자동 스캔하거나 첫 번째 디바이스에 연결.
         """
         try:
             if serial:
                 self.serial = serial
-            
-            # 지정된 시리얼이 없으면 일반적인 LDPlayer 포트 연결 시도
+
             if not self.serial:
                 devices = self.list_devices()
                 if devices:
                     self.serial = devices[0]
                 else:
-                    # 포트 수동 연결 시도 (LDPlayer & BlueStacks Air 기본 5555, 5556, 5557 등)
-                    for port in [5555, 5556, 5557, 5559, 5587]:
-                        try:
-                            adb.connect(f"127.0.0.1:{port}")
-                        except Exception:
-                            pass
+                    self._auto_connect_local_emulators()
                     devices = self.list_devices()
                     if devices:
                         self.serial = devices[0]
